@@ -1,0 +1,5 @@
+admin:123456
+user1:password
+sinhvien:dhcn
+vanhien:123
+huy:1235
