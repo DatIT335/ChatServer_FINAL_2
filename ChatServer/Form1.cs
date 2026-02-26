@@ -9,6 +9,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Windows.Forms;
 using ChatApp.Shared; // Bắt buộc: Namespace từ Models.cs
+using Microsoft.Data.Sqlite;
 
 namespace ChatServer
 {
@@ -29,7 +30,43 @@ namespace ChatServer
         {
             SetupUI();
         }
+        private void InitializeDatabase()
+        {
+            string dbPath = Path.Combine(Application.StartupPath, "ChatDB.sqlite");
+            using (var connection = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                connection.Open();
+                var command = connection.CreateCommand();
 
+                // Đã sửa: Tạo cả bảng Accounts và bảng ServerLogs cùng lúc
+                command.CommandText = @"
+            CREATE TABLE IF NOT EXISTS Accounts (
+                Username TEXT PRIMARY KEY,
+                Password TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ServerLogs (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                Timestamp DATETIME,
+                Content TEXT
+            );";
+                command.ExecuteNonQuery();
+
+                // Kiểm tra nếu chưa có tài khoản nào thì tạo mặc định
+                command.CommandText = "SELECT COUNT(*) FROM Accounts";
+                long count = (long)command.ExecuteScalar();
+                if (count == 0)
+                {
+                    command.CommandText = @"
+                INSERT INTO Accounts (Username, Password) VALUES ('admin', '123456');
+                INSERT INTO Accounts (Username, Password) VALUES ('user1', 'password');
+                INSERT INTO Accounts (Username, Password) VALUES ('sinhvien', 'dhcn');
+                INSERT INTO Accounts (Username, Password) VALUES ('vanhien', '123');
+                INSERT INTO Accounts (Username, Password) VALUES ('huy', '1235');
+            ";
+                    command.ExecuteNonQuery();
+                }
+            }
+        }
         // --- 3. THIẾT KẾ GIAO DIỆN (CODE THUẦN) ---
         private void SetupUI()
         {
@@ -67,6 +104,9 @@ namespace ChatServer
         {
             try
             {
+                // GỌI HÀM TẠO DATABASE TRƯỚC KHI BẬT LISTENER
+                InitializeDatabase();
+
                 listener = new TcpListener(IPAddress.Any, 9000);
                 listener.Start();
                 isRunning = true;
@@ -78,7 +118,6 @@ namespace ChatServer
                 lblStatus.Text = "ONLINE (Port 9000)";
                 lblStatus.ForeColor = Color.Green;
 
-                string accPath = Path.Combine(Application.StartupPath, "accounts.txt");
                 AddLog("Server đã khởi động.");
 
                 new Thread(ListenLoop).Start();
@@ -114,10 +153,33 @@ namespace ChatServer
         }
 
         // --- 5. CÁC HÀM CẬP NHẬT GIAO DIỆN ---
-        public void AddLog(string msg) => Invoke(new Action(() => {
-            txtLog.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}\n");
-            txtLog.ScrollToCaret();
-        }));
+        public void AddLog(string msg)
+        {
+            // 1. Vẫn hiển thị lên màn hình console đen của Server
+            Invoke(new Action(() => {
+                txtLog.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}\n");
+                txtLog.ScrollToCaret();
+            }));
+
+            // 2. [MỚI] Ghi vào cơ sở dữ liệu SQLite
+            try
+            {
+                string dbPath = Path.Combine(Application.StartupPath, "ChatDB.sqlite");
+                using (var connection = new SqliteConnection($"Data Source={dbPath}"))
+                {
+                    connection.Open();
+                    var command = connection.CreateCommand();
+
+                    command.CommandText = "INSERT INTO ServerLogs (Timestamp, Content) VALUES ($time, $content)";
+                    // Dùng DateTime.Now để lấy chính xác giờ trên máy tính
+                    command.Parameters.AddWithValue("$time", DateTime.Now);
+                    command.Parameters.AddWithValue("$content", msg);
+
+                    command.ExecuteNonQuery();
+                }
+            }
+            catch { }
+        }
 
         public void UpdateList(string name, string time, bool add) => Invoke(new Action(() => {
             if (add)
@@ -188,24 +250,24 @@ namespace ChatServer
         {
             try
             {
-                string path = Path.Combine(Application.StartupPath, "accounts.txt");
-                if (!File.Exists(path))
+                string dbPath = Path.Combine(Application.StartupPath, "ChatDB.sqlite");
+                using (var connection = new SqliteConnection($"Data Source={dbPath}"))
                 {
-                    File.WriteAllLines(path, new[] { "admin:123", "user1:123", "client:1" });
-                    Server.AddLog("[SYSTEM] Đã tạo file accounts.txt mặc định.");
-                }
+                    connection.Open();
+                    var command = connection.CreateCommand();
+                    // Sử dụng parameter để chống SQL Injection
+                    command.CommandText = "SELECT COUNT(*) FROM Accounts WHERE Username = $user AND Password = $pass";
+                    command.Parameters.AddWithValue("$user", user);
+                    command.Parameters.AddWithValue("$pass", pass);
 
-                foreach (string line in File.ReadAllLines(path))
-                {
-                    var parts = line.Split(':');
-                    if (parts.Length == 2)
-                    {
-                        if (parts[0].Trim().Equals(user, StringComparison.OrdinalIgnoreCase) && parts[1].Trim() == pass)
-                            return true;
-                    }
+                    long count = (long)command.ExecuteScalar();
+                    return count > 0;
                 }
             }
-            catch (Exception ex) { Server.AddLog("Lỗi đọc file: " + ex.Message); }
+            catch (Exception ex)
+            {
+                Server.AddLog("Lỗi Database: " + ex.Message);
+            }
             return false;
         }
 
@@ -247,7 +309,23 @@ namespace ChatServer
                     else if (IsAuthenticated)
                     {
                         // Log hoạt động (Trừ video để đỡ lag log)
-                        if (packet.Type == PacketType.Message) Server.AddLog($"Tin nhắn: {Username} -> {(string.IsNullOrEmpty(packet.Recipient) ? "All" : packet.Recipient)}");
+                        if (packet.Type == PacketType.Message)
+                        {
+                            string msgContent = "";
+                            try
+                            {
+                                // Yêu cầu Server giải mã nội dung tin nhắn bằng DefaultKey
+                                msgContent = SimpleAES.DecryptString(packet.Data, SimpleAES.DefaultKey, packet.IV);
+                            }
+                            catch
+                            {
+                                // Nếu không giải mã được (do Client dùng khóa riêng Diffie-Hellman)
+                                msgContent = "[Tin nhắn mã hóa riêng tư - Server không thể đọc]";
+                            }
+
+                            // Ghi log kèm theo nội dung tin nhắn
+                            Server.AddLog($"Tin nhắn: {Username} -> {(string.IsNullOrEmpty(packet.Recipient) ? "All" : packet.Recipient)}: {msgContent}");
+                        }
                         else if (packet.Type == PacketType.File) Server.AddLog($"File: {Username} gửi {packet.FileName}");
 
                         // --- LOGIC ĐỊNH TUYẾN QUAN TRỌNG ---
